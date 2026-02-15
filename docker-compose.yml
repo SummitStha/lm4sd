@@ -41,11 +41,13 @@ services:
       - PIPER_NE_MODEL=ne_NP-chitwan-medium
       - PIPER_HI_MODEL=hi_IN-rohan-medium
       - PIPER_EN_MODEL=en_US-amy-low
+      - TTS_MIN_CHARS=20
+      - TWILIO_SEND_FRAME_SLEEP=0.02
     ports:
       - "5000:5000"
     volumes:
       - ./app:/app
-    command: ["python3", "-u", "server.py"]
+    command: ["python3", "-u", "server_ptt_required.py"]
 
   # === Ngrok tunnel (for Twilio webhook) ===
   ngrok:

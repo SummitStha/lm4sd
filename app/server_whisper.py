@@ -5,7 +5,6 @@ import base64
 import audioop
 import re
 from typing import Optional, Tuple, List, Dict
-import noisereduce as nr
 
 import numpy as np
 import webrtcvad
@@ -265,50 +264,19 @@ def correct_language(text: str, detected: Optional[str]) -> str:
         return "hi"
     return "en"
 
-# def whisper_transcribe(pcm16_8k: bytes) -> Tuple[str, Optional[str]]:
-#     """
-#     Runs Whisper on an utterance (PCM16 @8k) and returns (text, detected_lang),
-#     with post-detection correction for Nepali vs Hindi.
-#     """
-#     audio = pcm8k_to_float16k(pcm16_8k)
-
-#     segments, info = whisper.transcribe(
-#         audio,
-#         beam_size=5,
-#         vad_filter=False,
-#         language=None,   # auto-detect
-#         task="transcribe"
-#     )
-
-#     text_parts: List[str] = []
-#     for seg in segments:
-#         if seg.text:
-#             text_parts.append(seg.text.strip())
-
-#     text = " ".join([t for t in text_parts if t]).strip()
-#     lang = getattr(info, "language", None)
-#     lang = correct_language(text, lang)
-#     return text, lang
-
-def whisper_transcribe(pcm16_8k: bytes, noise_pcm16_8k: Optional[bytes] = None) -> Tuple[str, Optional[str]]:
+def whisper_transcribe(pcm16_8k: bytes) -> Tuple[str, Optional[str]]:
+    """
+    Runs Whisper on an utterance (PCM16 @8k) and returns (text, detected_lang),
+    with post-detection correction for Nepali vs Hindi.
+    """
     audio = pcm8k_to_float16k(pcm16_8k)
-
-    noise = None
-    if noise_pcm16_8k:
-        noise = pcm8k_to_float16k(noise_pcm16_8k)
-
-    audio = enhance_audio_for_whisper(audio, noise_f32_16k=noise)
 
     segments, info = whisper.transcribe(
         audio,
         beam_size=5,
-        best_of=5,
-        temperature=0.0,
-        vad_filter=True,  # faster-whisper built-in VAD :contentReference[oaicite:3]{index=3}
-        vad_parameters=dict(min_silence_duration_ms=250),
-        language=None,
-        task="transcribe",
-        condition_on_previous_text=False,
+        vad_filter=False,
+        language=None,   # auto-detect
+        task="transcribe"
     )
 
     text_parts: List[str] = []
@@ -369,70 +337,11 @@ def stream_llm_reply(user_text: str, user_lang: Optional[str]):
 # ===========================================
 # Simple VAD segmenter (webrtcvad)
 # ===========================================
-# class VadSegmenter:
-#     def __init__(self, mode: int = 2, end_silence_ms: int = 600, max_utt_ms: int = 12000):
-#         self.vad = webrtcvad.Vad(mode)
-#         self.end_silence_ms = end_silence_ms
-#         self.max_utt_ms = max_utt_ms
-#         self.reset()
-
-#     def reset(self):
-#         self.in_speech = False
-#         self.frames: List[bytes] = []
-#         self.silence_ms = 0
-#         self.utt_ms = 0
-
-#     def push_frame(self, pcm16_frame_8k: bytes) -> Optional[bytes]:
-#         if len(pcm16_frame_8k) != PCM16_BYTES_PER_FRAME:
-#             return None
-
-#         is_speech = self.vad.is_speech(pcm16_frame_8k, TWILIO_SR)
-
-#         if is_speech:
-#             if not self.in_speech:
-#                 self.in_speech = True
-#                 self.frames = []
-#                 self.silence_ms = 0
-#                 self.utt_ms = 0
-
-#             self.frames.append(pcm16_frame_8k)
-#             self.utt_ms += FRAME_MS
-#             self.silence_ms = 0
-
-#             if self.utt_ms >= self.max_utt_ms:
-#                 utt = b"".join(self.frames)
-#                 self.reset()
-#                 return utt
-
-#         else:
-#             if self.in_speech:
-#                 self.silence_ms += FRAME_MS
-#                 self.frames.append(pcm16_frame_8k)
-#                 self.utt_ms += FRAME_MS
-
-#                 if self.silence_ms >= self.end_silence_ms:
-#                     utt = b"".join(self.frames)
-#                     self.reset()
-#                     return utt
-
-#         return None
-
 class VadSegmenter:
-    def __init__(
-        self,
-        mode: int = 2,
-        end_silence_ms: int = 600,
-        max_utt_ms: int = 12000,
-        preroll_ms: int = 300,
-        noise_ms: int = 1000,
-    ):
+    def __init__(self, mode: int = 2, end_silence_ms: int = 600, max_utt_ms: int = 12000):
         self.vad = webrtcvad.Vad(mode)
         self.end_silence_ms = end_silence_ms
         self.max_utt_ms = max_utt_ms
-
-        self.preroll_frames = int(preroll_ms / FRAME_MS)          # e.g., 300ms -> 15 frames
-        self.noise_frames_max = int(noise_ms / FRAME_MS)          # e.g., 1000ms -> 50 frames
-
         self.reset()
 
     def reset(self):
@@ -441,30 +350,11 @@ class VadSegmenter:
         self.silence_ms = 0
         self.utt_ms = 0
 
-        # ring buffers
-        self.preroll: List[bytes] = []
-        self.noise_buf: List[bytes] = []
-
-    def _push_ring(self, ring: List[bytes], frame: bytes, maxlen: int):
-        ring.append(frame)
-        if len(ring) > maxlen:
-            ring.pop(0)
-
-    def push_frame(self, pcm16_frame_8k: bytes) -> Optional[Tuple[bytes, bytes]]:
-        """
-        Returns (utterance_pcm16_8k, noise_pcm16_8k) when an utterance ends.
-        noise_pcm16_8k is recent non-speech audio you can use as a noise profile.
-        """
+    def push_frame(self, pcm16_frame_8k: bytes) -> Optional[bytes]:
         if len(pcm16_frame_8k) != PCM16_BYTES_PER_FRAME:
             return None
 
         is_speech = self.vad.is_speech(pcm16_frame_8k, TWILIO_SR)
-
-        if not self.in_speech:
-            # maintain preroll + noise buffers during silence
-            self._push_ring(self.preroll, pcm16_frame_8k, self.preroll_frames)
-            if not is_speech:
-                self._push_ring(self.noise_buf, pcm16_frame_8k, self.noise_frames_max)
 
         if is_speech:
             if not self.in_speech:
@@ -473,18 +363,14 @@ class VadSegmenter:
                 self.silence_ms = 0
                 self.utt_ms = 0
 
-                # prepend preroll to avoid clipping initial phonemes
-                self.frames.extend(self.preroll)
-
             self.frames.append(pcm16_frame_8k)
             self.utt_ms += FRAME_MS
             self.silence_ms = 0
 
             if self.utt_ms >= self.max_utt_ms:
                 utt = b"".join(self.frames)
-                noise = b"".join(self.noise_buf)
                 self.reset()
-                return (utt, noise)
+                return utt
 
         else:
             if self.in_speech:
@@ -494,50 +380,10 @@ class VadSegmenter:
 
                 if self.silence_ms >= self.end_silence_ms:
                     utt = b"".join(self.frames)
-                    noise = b"".join(self.noise_buf)
                     self.reset()
-                    return (utt, noise)
+                    return utt
 
         return None
-
-
-def enhance_audio_for_whisper(audio_f32_16k: np.ndarray, noise_f32_16k: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Lightweight telephony-oriented enhancement.
-    audio_f32_16k: float32 in [-1,1], 16kHz
-    """
-    if audio_f32_16k.size == 0:
-        return audio_f32_16k
-
-    x = audio_f32_16k.astype(np.float32)
-
-    # 1) DC removal
-    x = x - np.mean(x)
-
-    # 2) RMS normalize (target ~ -20 dBFS => rms ~ 0.1)
-    rms = float(np.sqrt(np.mean(x * x)) + 1e-8)
-    target_rms = 0.10
-    gain = target_rms / rms
-    # limit gain to avoid amplifying pure noise too much
-    gain = float(np.clip(gain, 0.25, 8.0))
-    x = x * gain
-
-    # 3) Pre-emphasis (helps intelligibility on narrowband speech)
-    pre = 0.97
-    x = np.append(x[0], x[1:] - pre * x[:-1])
-
-    # 4) Optional noise reduction (CPU-costly; keep easy to disable)
-    if noise_f32_16k is not None and noise_f32_16k.size > 0:
-        try:
-            x = nr.reduce_noise(y=x, sr=16000, y_noise=noise_f32_16k.astype(np.float32), stationary=True)
-        except Exception as e:
-            print(f"[WARN] noise reduction failed: {e}")
-
-    # 5) Soft clip
-    x = np.tanh(1.5 * x)
-
-    return x.astype(np.float32)
-
 
 # ===========================================
 # WebSocket: Twilio Media Stream endpoint
@@ -584,13 +430,9 @@ def ws(ws):
                     frame = bytes(audio_buf[:PCM16_BYTES_PER_FRAME])
                     del audio_buf[:PCM16_BYTES_PER_FRAME]
 
-                    # utt = segmenter.push_frame(frame)
-                    # if utt:
-                    #     text, lang = whisper_transcribe(utt)
-                    res = segmenter.push_frame(frame)
-                    if res:
-                        utt, noise = res
-                        text, lang = whisper_transcribe(utt, noise)
+                    utt = segmenter.push_frame(frame)
+                    if utt:
+                        text, lang = whisper_transcribe(utt)
                         text = (text or "").strip()
                         if not text:
                             continue

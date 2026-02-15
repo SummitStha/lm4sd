@@ -4,6 +4,8 @@ import time
 import base64
 import audioop
 import re
+import threading
+import queue
 from typing import Optional, Tuple, List, Dict
 import noisereduce as nr
 
@@ -173,7 +175,7 @@ def speak_text_to_mulaw_8k(text: str, tts_voice: PiperVoice) -> bytes:
         print(f"[ERROR] Piper synthesis failed: {e}")
         return b""
 
-def send_audio_to_twilio(ws, stream_sid: str, mulaw_bytes: bytes):
+def send_audio_to_twilio(ws, stream_sid: str, mulaw_bytes: bytes, send_lock: Optional[threading.Lock] = None):
     """
     Twilio expects JSON messages with:
       event=media, streamSid, media.payload (base64)
@@ -191,14 +193,46 @@ def send_audio_to_twilio(ws, stream_sid: str, mulaw_bytes: bytes):
             "streamSid": stream_sid,
             "media": {"payload": payload},
         }
-        ws.send(json.dumps(message))
+        payload_json = json.dumps(message)
+        if send_lock:
+            with send_lock:
+                ws.send(payload_json)
+        else:
+            ws.send(payload_json)
         time.sleep(0.02)  # pacing: 20ms
 
-    ws.send(json.dumps({
+    mark_json = json.dumps({
         "event": "mark",
         "streamSid": stream_sid,
         "mark": {"name": "done"},
-    }))
+    })
+    if send_lock:
+        with send_lock:
+            ws.send(mark_json)
+    else:
+        ws.send(mark_json)
+
+
+def send_clear_to_twilio(ws, stream_sid: str, send_lock: Optional[threading.Lock] = None):
+    """Clear any buffered outbound audio in Twilio for this stream."""
+    msg = {"event": "clear", "streamSid": stream_sid}
+    payload_json = json.dumps(msg)
+    if send_lock:
+        with send_lock:
+            ws.send(payload_json)
+    else:
+        ws.send(payload_json)
+
+
+def beep_mulaw_8k(freq: int = 880, duration_ms: int = 200, sr: int = 8000, amp: float = 0.25) -> bytes:
+    """Generate a short beep (mulaw/8k) to acknowledge push-to-talk start."""
+    n = int(sr * (duration_ms / 1000.0))
+    if n <= 0:
+        return b""
+    t = (np.arange(n, dtype=np.float32) / float(sr))
+    x = amp * np.sin(2.0 * np.pi * float(freq) * t)
+    pcm16 = (np.clip(x, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+    return audioop.lin2ulaw(pcm16, 2)
 
 # ===========================================
 # Whisper STT helpers
@@ -304,7 +338,7 @@ def whisper_transcribe(pcm16_8k: bytes, noise_pcm16_8k: Optional[bytes] = None) 
         beam_size=5,
         best_of=5,
         temperature=0.0,
-        vad_filter=True,  # faster-whisper built-in VAD :contentReference[oaicite:3]{index=3}
+        vad_filter=True,  # faster-whisper built-in VAD {index=3}
         vad_parameters=dict(min_silence_duration_ms=250),
         language=None,
         task="transcribe",
@@ -546,18 +580,102 @@ def enhance_audio_for_whisper(audio_f32_16k: np.ndarray, noise_f32_16k: Optional
 def ws(ws):
     print(">> Stream connected")
 
-    stream_sid = None
+    stream_sid: Optional[str] = None
+
+    # Inbound audio buffering (Twilio sends mulaw/8k, we decode to PCM16/8k)
     audio_buf = bytearray()
-    segmenter = VadSegmenter(mode=2, end_silence_ms=600, max_utt_ms=12000)
+
+    # VAD-based fallback mode
+    segmenter = VadSegmenter(mode=2, end_silence_ms=350, max_utt_ms=12000)
+
+    # Push-to-talk (DTMF "5") mode (fallback: if no DTMF events arrive, VAD still works)
+    ptt_active = False
+    ptt_buf = bytearray()
+
+    # Noise profile ring buffer (used for optional noise reduction)
+    noise_vad = webrtcvad.Vad(2)
+    noise_ring: List[bytes] = []
+    NOISE_FRAMES_MAX = int(1000 / FRAME_MS)  # ~1s
+
+    def push_noise(frame: bytes):
+        nonlocal noise_ring
+        try:
+            if not noise_vad.is_speech(frame, TWILIO_SR):
+                noise_ring.append(frame)
+                if len(noise_ring) > NOISE_FRAMES_MAX:
+                    noise_ring.pop(0)
+        except Exception:
+            pass
+
+    # Threading: keep receiving audio while STT/LLM/TTS runs
+    send_lock = threading.Lock()
+    work_q: "queue.Queue[Tuple[bytes, bytes]]" = queue.Queue(maxsize=4)
+    stop_evt = threading.Event()
+    assistant_busy = threading.Event()  # set while generating/speaking
 
     # LLM->TTS batching (avoid speaking tiny subwords)
     tts_buffer = ""
-    MIN_CHARS = 60
+    MIN_CHARS = 30
 
     def should_flush(buf: str) -> bool:
         if len(buf) >= MIN_CHARS:
             return True
-        return bool(re.search(r"[\.!\?\n]|।", buf))
+        # punctuation-based flush for natural latency
+        return bool(re.search(r"[\.!\?\n,;:]|।", buf))
+
+    def respond_to_utterance(utt_pcm16_8k: bytes, noise_pcm16_8k: bytes):
+        nonlocal tts_buffer
+
+        text, lang = whisper_transcribe(utt_pcm16_8k, noise_pcm16_8k)
+        text = (text or "").strip()
+        if not text:
+            return
+
+        print(f"[User] ({lang}) {text}")
+
+        full_reply = ""
+        current_tts_lang = lang if lang in ("ne", "hi", "en") else "hi"
+        tts_voice = PIPER_VOICES.get(current_tts_lang, PIPER_VOICES["hi"])
+
+        for rchunk, reply_lang in stream_llm_reply(text, lang):
+            full_reply += rchunk
+
+            if reply_lang in ("ne", "hi", "en"):
+                current_tts_lang = reply_lang
+                tts_voice = PIPER_VOICES.get(current_tts_lang, PIPER_VOICES["hi"])
+
+            tts_buffer += rchunk
+            if should_flush(tts_buffer):
+                mulaw = speak_text_to_mulaw_8k(tts_buffer, tts_voice)
+                if mulaw and stream_sid:
+                    send_audio_to_twilio(ws, stream_sid, mulaw, send_lock=send_lock)
+                tts_buffer = ""
+
+        if tts_buffer.strip():
+            mulaw = speak_text_to_mulaw_8k(tts_buffer, tts_voice)
+            if mulaw and stream_sid:
+                send_audio_to_twilio(ws, stream_sid, mulaw, send_lock=send_lock)
+            tts_buffer = ""
+
+        print("[LLM full]", full_reply.strip())
+
+    def worker_loop():
+        while not stop_evt.is_set():
+            item = work_q.get()
+            if item is None:
+                break
+            utt_pcm16_8k, noise_pcm16_8k = item
+            assistant_busy.set()
+            try:
+                respond_to_utterance(utt_pcm16_8k, noise_pcm16_8k)
+            except Exception as e:
+                print(f"[ERROR] worker: {e}")
+            finally:
+                assistant_busy.clear()
+                work_q.task_done()
+
+    worker = threading.Thread(target=worker_loop, daemon=True)
+    worker.start()
 
     try:
         while True:
@@ -572,6 +690,43 @@ def ws(ws):
                 stream_sid = data["start"]["streamSid"]
                 print(f">> Stream started (SID: {stream_sid})")
 
+            elif event == "dtmf":
+                # Twilio Media Streams sends DTMF keypress events over the same WS. 
+                digit = None
+                d = data.get("dtmf") or {}
+                digit = d.get("digit") or d.get("digits") or data.get("digit")
+
+                print(f">> DTMF: {digit}")
+
+                if digit == "5" and stream_sid:
+                    if not ptt_active:
+                        # START recording
+                        ptt_active = True
+                        ptt_buf = bytearray()
+
+                        # Optional: clear any queued outbound audio so the beep is immediate. 
+                        send_clear_to_twilio(ws, stream_sid, send_lock=send_lock)
+
+                        # Beep acknowledgement
+                        b = beep_mulaw_8k()
+                        if b:
+                            send_audio_to_twilio(ws, stream_sid, b, send_lock=send_lock)
+
+                        print(">> PTT ON (recording)")
+                    else:
+                        # STOP recording
+                        ptt_active = False
+                        print(">> PTT OFF (transcribing)")
+
+                        # Minimum length guard (~300ms)
+                        if len(ptt_buf) >= int(0.3 * TWILIO_SR) * 2:
+                            noise_bytes = b"".join(noise_ring)
+                            try:
+                                work_q.put_nowait((bytes(ptt_buf), noise_bytes))
+                            except queue.Full:
+                                print("[WARN] work queue full, dropping utterance")
+                        ptt_buf = bytearray()
+
             elif event == "media":
                 if not stream_sid:
                     continue
@@ -584,56 +739,47 @@ def ws(ws):
                     frame = bytes(audio_buf[:PCM16_BYTES_PER_FRAME])
                     del audio_buf[:PCM16_BYTES_PER_FRAME]
 
-                    # utt = segmenter.push_frame(frame)
-                    # if utt:
-                    #     text, lang = whisper_transcribe(utt)
+                    # Build a noise profile during non-speech periods
+                    push_noise(frame)
+
+                    # If push-to-talk is active, just buffer the raw PCM16 frames.
+                    if ptt_active:
+                        ptt_buf.extend(frame)
+                        continue
+
+                    # Otherwise, use VAD-based fallback segmentation.
                     res = segmenter.push_frame(frame)
                     if res:
                         utt, noise = res
-                        text, lang = whisper_transcribe(utt, noise)
-                        text = (text or "").strip()
-                        if not text:
-                            continue
+                        # If assistant is currently speaking, you might still want to accept input
+                        # (fallback mode). If you want stricter turn-taking, uncomment next lines:
+                        # if assistant_busy.is_set():
+                        #     continue
 
-                        # corrected language already applied
-                        print(f"[User] ({lang}) {text}")
-
-                        full_reply = ""
-                        current_tts_lang = lang if lang in ("ne", "hi", "en") else "hi"
-                        tts_voice = PIPER_VOICES.get(current_tts_lang, PIPER_VOICES["hi"])
-
-                        for rchunk, reply_lang in stream_llm_reply(text, lang):
-                            full_reply += rchunk
-                            print("[LLM partial]", rchunk.strip())
-
-                            # Keep TTS voice synced to reply language (auto mode)
-                            if reply_lang in ("ne", "hi", "en"):
-                                current_tts_lang = reply_lang
-                                tts_voice = PIPER_VOICES.get(current_tts_lang, PIPER_VOICES["hi"])
-
-                            tts_buffer += rchunk
-                            if should_flush(tts_buffer):
-                                mulaw = speak_text_to_mulaw_8k(tts_buffer, tts_voice)
-                                if mulaw:
-                                    send_audio_to_twilio(ws, stream_sid, mulaw)
-                                tts_buffer = ""
-
-                        if tts_buffer.strip():
-                            mulaw = speak_text_to_mulaw_8k(tts_buffer, tts_voice)
-                            if mulaw:
-                                send_audio_to_twilio(ws, stream_sid, mulaw)
-                            tts_buffer = ""
-
-                        print("[LLM full]", full_reply.strip())
+                        try:
+                            work_q.put_nowait((utt, noise))
+                        except queue.Full:
+                            print("[WARN] work queue full, dropping utterance")
 
             elif event == "stop":
                 print(">> Stream stopped")
                 break
 
+            elif event == "mark":
+                # Twilio sends mark events back when playback finishes (if we send marks). 
+                pass
+
     except Exception as e:
         print(f"[ERROR] WS Handler: {e}")
 
+    stop_evt.set()
+    try:
+        work_q.put_nowait(None)
+    except Exception:
+        pass
+
     print(">> Stream closed")
+
 
 # ===========================================
 # Twilio webhook
@@ -651,9 +797,9 @@ def twilio_call():
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Hello! Connecting you to the multilingual voice assistant now.</Say>
+  <Say>Hello! Press 5 to start talking, then press 5 again when you are done. You will hear a beep when recording starts.</Say>
   <Connect>
-    <Stream url="{stream_url}" />
+    <Stream url="{stream_url}"><Parameter name="pttDigit" value="5" /></Stream>
   </Connect>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
