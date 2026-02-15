@@ -1,0 +1,8 @@
+# ---- Ollama service ----
+FROM ollama/ollama:latest
+
+# Pre-pull llama3 during build
+RUN /bin/bash -c "ollama pull llama3"
+
+# (optional) expose the port if you want direct host access
+EXPOSE 11434

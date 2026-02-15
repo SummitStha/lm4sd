@@ -1,0 +1,10 @@
+flask
+flask-sock
+vosk
+numpy
+soundfile
+requests
+httpx
+webrtcvad
+noisereduce
+piper-tts

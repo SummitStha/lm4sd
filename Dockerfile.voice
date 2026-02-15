@@ -1,0 +1,38 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# --- Add required build dependencies ---
+RUN apt-get update && apt-get install -y \
+    ffmpeg sox libsox-fmt-all wget unzip curl git \
+    build-essential python3-dev && \
+    pip install --upgrade pip
+
+COPY app/requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download Piper voice model
+RUN mkdir -p /root/.local/share/piper/voices/en_US-amy-low && \
+    cd /root/.local/share/piper/voices/en_US-amy-low && \
+    wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low/en_US-amy-low.onnx && \
+    wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low/en_US-amy-low.onnx.json
+
+# Download Piper Hindi voice model (hi_IN-rohan-medium)
+RUN mkdir -p /root/.local/share/piper/voices/hi_IN-rohan-medium && \
+    cd /root/.local/share/piper/voices/hi_IN-rohan-medium && \
+    wget -O hi_IN-rohan-medium.onnx \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx && \
+    wget -O hi_IN-rohan-medium.onnx.json \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json
+
+# Download Piper Nepali voice model (ne_NP-chitwan-medium)
+RUN mkdir -p /root/.local/share/piper/voices/ne_NP-chitwan-medium && \
+    cd /root/.local/share/piper/voices/ne_NP-chitwan-medium && \
+    wget -O ne_NP-chitwan-medium.onnx \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/ne/ne_NP/chitwan/medium/ne_NP-chitwan-medium.onnx && \
+    wget -O ne_NP-chitwan-medium.onnx.json \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/ne/ne_NP/chitwan/medium/ne_NP-chitwan-medium.onnx.json
+
+COPY app /app
+EXPOSE 5000
+CMD ["python3", "-u", "server.py"]
